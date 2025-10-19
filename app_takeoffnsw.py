@@ -14,18 +14,22 @@ st.set_page_config(page_title="TakeoffNSW Formatter", layout="wide")
 # Helper functions (same logic as your pipeline)
 # -----------------------
 def read_input_file(uploaded_file):
-    # Accept CSV or Excel
+    """
+    Accept CSV or Excel (xls/xlsx) from Streamlit uploader and return pd.DataFrame with str values.
+    """
     try:
-        if uploaded_file.name.lower().endswith((".xls", ".xlsx")):
-            return pd.read_excel(uploaded_file, dtype=str).fillna("")
+        name = uploaded_file.name.lower()
+        if name.endswith((".xls", ".xlsx")):
+            return pd.read_excel(uploaded_file, dtype=str, engine="openpyxl").fillna("")
         else:
-            # try common encodings via pandas
-            return pd.read_csv(uploaded_file, dtype=str, encoding="utf-8").fillna("")
-    except Exception:
-        try:
-            return pd.read_csv(uploaded_file, dtype=str, encoding="latin1").fillna("")
-        except Exception:
-            return pd.read_csv(uploaded_file, dtype=str, sep=",").fillna("")
+            # CSV - try utf-8 then latin1
+            try:
+                return pd.read_csv(uploaded_file, dtype=str, encoding="utf-8").fillna("")
+            except Exception:
+                return pd.read_csv(uploaded_file, dtype=str, encoding="latin1").fillna("")
+    except Exception as exc:
+        st.error(f"Failed to read uploaded file: {exc}")
+        raise
 
 def normalize_text(x):
     if x is None:
@@ -49,139 +53,156 @@ def neck_numeric(s):
     nums = re.findall(r"\d+\.?\d*", s)
     return float(nums[0]) if nums else float("inf")
 
-# default mapping (template -> raw column)
-DEFAULT_MAPPING = {
-    'PRODUCT': 'Subject',
-    'SCHEDULE BRAND': 'MANUFACTURER',
-    'SCHEDULE MODEL': 'MODEL',
-    'BRAND': 'MANUFACTURER',
-    'MODEL': 'MODEL',
-    'QTY': 'Count',
-    'TAG': 'Label',
-    'NECK SIZE': 'NECK SIZE',
-    'MODULE SIZE': 'FACE SIZE',
-    'DUCT SIZE': 'DUCT SIZE',
-    'TYPE': 'TYPE',
-    'MOUNTING': 'MOUNTING',
-    'ACCESSORIES1': 'ACCESSORIES',
-    'ACCESSORIES2': 'ACCESSORIES',
-    'REMARK': 'REMARK'
+# -----------------------
+# Mapping (multi-candidate mapping)
+# -----------------------
+MAPPING_MULTI = {
+    "PRODUCT": ["Subject"],
+    "PRODUCT": ["PRODUCT"],
+    "SCHEDULE BRAND": ["MANUFACTURER"],
+    "SCHEDULE MODEL": ["MODEL"],
+    "BRAND": ["MANUFACTURER"],
+    "MODEL": ["MODEL"],
+    "QTY": ["Count"],
+    "TAG": ["Label"],
+    "TAG": ["TAG"],
+    "NECK SIZE": ["NECK SIZE"],
+    "MODULE SIZE": ["FACE SIZE"],
+    "DUCT SIZE": ["DUCT SIZE"],
+    "TYPE": ["TYPE"],
+    "MOUNTING": ["MOUNTING"],
+    "ACCESSORIES1": ["ACCESSORIES"],
+    "ACCESSORIES2": ["ACCESSORIES"],
+    "DESCRIPTION": ["DESCRIPTION"],
+    "UNITS": ["UNITS"],
+    "DAMPER TYPE": ["DAMPER TYPE"],
+    "REMARK": ["REMARK"]
 }
 
-BOLD_VALUE_COLS_DEFAULT = ['PRODUCT', 'SCHEDULE BRAND', 'BRAND', 'TAG', 'MODULE SIZE', 'TYPE', 'ACCESSORIES1']
+DEFAULT_BOLD_VALUE_COLS = [
+    "PRODUCT", "SCHEDULE BRAND", "BRAND", "TAG", "MODULE SIZE", "TYPE", "ACCESSORIES1"
+]
 
-# core pipeline to produce df_out (unformatted strings)
-def takeoff_pipeline(df_raw, mapping=DEFAULT_MAPPING, brand_rules=True,
-                     model_blank=True, empty_dot=True, bold_value_cols=BOLD_VALUE_COLS_DEFAULT):
-    # normalize column names
+# ---------- Build takeoff df from raw using MAPPING_MULTI ----------
+def build_takeoff_df_from_raw(df_raw: pd.DataFrame, mapping_multi: dict = MAPPING_MULTI) -> pd.DataFrame:
+    """
+    Build a dataframe with columns equal to mapping_multi keys.
+    For each target header, pick the first raw column name from the candidates that exists in df_raw.
+    If none exist, fill with empty string.
+    """
     df_raw = df_raw.copy()
+    # Normalize raw column names by stripping (but keep exact names for lookup)
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-    # apply mapping to template headers
-    template_headers = list(mapping.keys())
+    target_headers = list(mapping_multi.keys())
     rows = []
     for _, r in df_raw.iterrows():
         out = {}
-        for th in template_headers:
-            rc = mapping.get(th, "")
-            val = r.get(rc, "") if rc in r.index else ""
+        for th in target_headers:
+            candidates = mapping_multi.get(th, [])
+            val = ""
+            for cand in candidates:
+                if cand in df_raw.columns:
+                    val = r.get(cand, "")
+                    break
             if isinstance(val, str):
                 val = " ".join(val.split())
             out[th] = val
         rows.append(out)
-    df = pd.DataFrame(rows, columns=template_headers)
+    return pd.DataFrame(rows, columns=target_headers)
 
-    # brand rules (clear then apply)
-    if 'BRAND' not in df.columns:
-        df['BRAND'] = ''
-    else:
-        df['BRAND'] = ''
+# ---------- Core pipeline ----------
+def takeoff_pipeline(df_raw, mapping_multi=MAPPING_MULTI, brand_rules=True,
+                     model_blank=True, empty_dot=True, bold_value_cols=DEFAULT_BOLD_VALUE_COLS):
+    # Build initial dataframe with template headers
+    df = build_takeoff_df_from_raw(df_raw, mapping_multi=mapping_multi)
 
-    if brand_rules and 'PRODUCT' in df.columns:
-        df.loc[df['PRODUCT'].str.contains(r'AD[-\s]?GRD', case=False, na=False), 'BRAND'] = 'PRICE'
-        df.loc[df['PRODUCT'].str.contains(r'\bFAN\b', case=False, na=False), 'BRAND'] = 'LOREN COOK'
-        df.loc[df['PRODUCT'].str.contains(r'SPLIT SYSTEM HEAT PUMP', case=False, na=False), 'BRAND'] = 'SAMSUNG'
+    # BRAND auto-fill rules (clear then set)
+    df["BRAND"] = ""
+    if brand_rules and "PRODUCT" in df.columns:
+        df.loc[df["PRODUCT"].str.contains(r"AD[-\s]?GRD", case=False, na=False), "BRAND"] = "PRICE"
+        df.loc[df["PRODUCT"].str.contains(r"\bFAN\b", case=False, na=False), "BRAND"] = "LOREN COOK"
+        df.loc[df["PRODUCT"].str.contains(r"SPLIT SYSTEM HEAT PUMP", case=False, na=False), "BRAND"] = "SAMSUNG"
 
-    # clear MODEL if requested
-    if model_blank and 'MODEL' in df.columns:
-        df['MODEL'] = ''
+    # Clear MODEL if requested
+    if model_blank and "MODEL" in df.columns:
+        df["MODEL"] = ""
 
-    # sorting helpers
-    df['_neck_num'] = df['NECK SIZE'].apply(neck_numeric) if 'NECK SIZE' in df.columns else float('inf')
-    df['_product_norm'] = df['PRODUCT'].astype(str).str.strip().str.upper() if 'PRODUCT' in df.columns else ''
-    df['_tag_norm'] = df['TAG'].astype(str).str.strip().str.upper() if 'TAG' in df.columns else ''
-    df_sorted = df.sort_values(by=['_product_norm','_tag_norm','_neck_num','PRODUCT'], ascending=[True, True, True, True], kind='mergesort')
+    # Add sorting helpers
+    df["_neck_num"] = df["NECK SIZE"].apply(neck_numeric) if "NECK SIZE" in df.columns else float("inf")
+    df["_product_norm"] = df["PRODUCT"].astype(str).str.strip().str.upper() if "PRODUCT" in df.columns else ""
+    df["_tag_norm"] = df["TAG"].astype(str).str.strip().str.upper() if "TAG" in df.columns else ""
+    df_sorted = df.sort_values(by=["_product_norm", "_tag_norm", "_neck_num", "PRODUCT"], ascending=[True, True, True, True], kind="mergesort")
 
-    # grouping keys
+    # Grouping keys
     GROUP_FIELDS = [
-        'PRODUCT','SCHEDULE BRAND','SCHEDULE MODEL','BRAND','MODEL',
-        'NECK SIZE','MODULE SIZE','DUCT SIZE','TYPE','MOUNTING',
-        'ACCESSORIES1','ACCESSORIES2','REMARK'
+        "PRODUCT","SCHEDULE BRAND","SCHEDULE MODEL","BRAND","MODEL",
+        "NECK SIZE","MODULE SIZE","DUCT SIZE","TYPE","MOUNTING",
+        "ACCESSORIES1","ACCESSORIES2","REMARK"
     ]
-    df_sorted['_key'] = df_sorted.apply(lambda r: tuple(normalize_text(r.get(c,'')) for c in GROUP_FIELDS), axis=1)
-    df_sorted['_qty'] = df_sorted['QTY'].apply(parse_qty) if 'QTY' in df_sorted.columns else 0.0
+    df_sorted["_key"] = df_sorted.apply(lambda r: tuple(normalize_text(r.get(c,"")) for c in GROUP_FIELDS), axis=1)
+    df_sorted["_qty"] = df_sorted["QTY"].apply(parse_qty) if "QTY" in df_sorted.columns else 0.0
 
     grouped_rows = []
-    product_order = sorted(df_sorted['_product_norm'].unique(), key=lambda x: x or '')
+    product_order = sorted(df_sorted["_product_norm"].unique(), key=lambda x: x or "")
     for prod in product_order:
-        prod_group = df_sorted[df_sorted['_product_norm'] == prod]
+        prod_group = df_sorted[df_sorted["_product_norm"] == prod]
         if prod_group.empty:
             continue
-        tags_in_prod = sorted(prod_group['_tag_norm'].unique(), key=lambda x: x or '')
+        tags_in_prod = sorted(prod_group["_tag_norm"].unique(), key=lambda x: x or "")
         for tag in tags_in_prod:
-            tag_group = prod_group[prod_group['_tag_norm'] == tag]
+            tag_group = prod_group[prod_group["_tag_norm"] == tag]
             if tag_group.empty:
                 continue
-            grouped = tag_group.groupby('_key', sort=False)
+            grouped = tag_group.groupby("_key", sort=False)
             for _, sub in grouped:
                 rep = sub.iloc[0].to_dict()
-                rep['QTY'] = f"{sub['_qty'].sum():.2f}"
-                if 'MODEL' in rep:
-                    rep['MODEL'] = '' if model_blank else rep.get('MODEL','')
+                rep["QTY"] = f"{sub['_qty'].sum():.2f}"
+                if model_blank and "MODEL" in rep:
+                    rep["MODEL"] = ""
                 grouped_rows.append(rep)
-            subtotal = tag_group['_qty'].sum()
-            prod_text = prod_group.iloc[0]['PRODUCT']
-            tag_label = tag if tag else ''
-            subtotal_row = {c:'' for c in df_sorted.columns}
-            subtotal_row['PRODUCT'] = f"{prod_text} - {tag_label} TOTAL = ({subtotal:.2f})"
-            subtotal_row['TAG'] = f"{tag_label} TOTAL"
-            subtotal_row['QTY'] = f"{subtotal:.2f}"
+            subtotal = tag_group["_qty"].sum()
+            prod_text = prod_group.iloc[0]["PRODUCT"]
+            tag_label = tag if tag else ""
+            subtotal_row = {c:"" for c in df_sorted.columns}
+            subtotal_row["PRODUCT"] = f"{prod_text} - {tag_label} TOTAL = ({subtotal:.2f})"
+            subtotal_row["TAG"] = f"{tag_label} TOTAL"
+            subtotal_row["QTY"] = f"{subtotal:.2f}"
             if model_blank:
-                subtotal_row['MODEL'] = ''
+                subtotal_row["MODEL"] = ""
             grouped_rows.append(subtotal_row)
 
-    grand_total = df_sorted['_qty'].sum()
-    grand_row = {c:'' for c in df_sorted.columns}
-    grand_row['PRODUCT'] = "Grand Total"
-    grand_row['TAG'] = "Grand Total"
-    grand_row['QTY'] = f"{grand_total:.2f}"
+    grand_total = df_sorted["_qty"].sum()
+    grand_row = {c:"" for c in df_sorted.columns}
+    grand_row["PRODUCT"] = "Grand Total"
+    grand_row["TAG"] = "Grand Total"
+    grand_row["QTY"] = f"{grand_total:.2f}"
     if model_blank:
-        grand_row['MODEL'] = ''
+        grand_row["MODEL"] = ""
     grouped_rows.append(grand_row)
 
     df_out = pd.DataFrame(grouped_rows)
-    # drop helper columns if present
-    drop_cols = [c for c in ['_neck_num','_product_norm','_tag_norm','_key','_qty'] if c in df_out.columns]
-    df_out = df_out.drop(columns=drop_cols, errors='ignore')
+    # Drop helper columns if present
+    drop_cols = [c for c in ["_neck_num","_product_norm","_tag_norm","_key","_qty"] if c in df_out.columns]
+    df_out = df_out.drop(columns=drop_cols, errors="ignore")
 
     # Fill empties with dot or keep model blank
     if empty_dot:
-        # Replace pure-empty strings with '.' but keep MODEL blank if requested
         for col in df_out.columns:
-            if col == 'MODEL' and model_blank:
-                df_out[col] = df_out[col].replace({None:'', pd.NA: ''}).astype(str).replace(r'^\s*$', '', regex=True)
+            if col == "MODEL" and model_blank:
+                # keep model blank
+                df_out[col] = df_out[col].replace({None:"", pd.NA:""}).astype(str).replace(r"^\s*$", "", regex=True)
             else:
-                df_out[col] = df_out[col].replace({None:'', pd.NA: ''}).astype(str).replace(r'^\s*$', '.', regex=True)
+                df_out[col] = df_out[col].replace({None:"", pd.NA:""}).astype(str).replace(r"^\s*$", ".", regex=True)
     else:
-        # keep empties as ''
         for col in df_out.columns:
-            if col == 'MODEL' and model_blank:
-                df_out[col] = df_out[col].replace({None:'', pd.NA: ''}).astype(str).replace(r'^\s*$', '', regex=True)
+            if col == "MODEL" and model_blank:
+                df_out[col] = df_out[col].replace({None:"", pd.NA:""}).astype(str).replace(r"^\s*$", "", regex=True)
             else:
-                df_out[col] = df_out[col].replace({None:'', pd.NA: ''}).astype(str)
+                df_out[col] = df_out[col].replace({None:"", pd.NA:""}).astype(str)
 
-    # ensure final column order as in mapping
-    final_cols = [c for c in mapping.keys() if c in df_out.columns]
+    # Ensure final column order as mapping keys then others
+    final_cols = [c for c in mapping_multi.keys() if c in df_out.columns]
     for c in df_out.columns:
         if c not in final_cols:
             final_cols.append(c)
@@ -189,8 +210,8 @@ def takeoff_pipeline(df_raw, mapping=DEFAULT_MAPPING, brand_rules=True,
 
     return df_out, final_cols
 
+# ---------- Excel exporter that returns bytes ----------
 def export_styled_excel_bytes(df_out, final_cols, bold_value_cols, header_fill_hex="FFD966"):
-    # create workbook and style
     wb = Workbook()
     ws = wb.active
     ws.title = "Takeoff NSW"
@@ -200,52 +221,53 @@ def export_styled_excel_bytes(df_out, final_cols, bold_value_cols, header_fill_h
     grand_fill = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
     qty_red = "FF0000"
 
-    # header
+    # Header row
     for i, col in enumerate(final_cols, start=1):
         cell = ws.cell(row=1, column=i, value=col)
         cell.font = Font(bold=True)
         cell.fill = header_fill
-        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    # rows
+    # Data rows
     for r_idx, (_, row) in enumerate(df_out.iterrows(), start=2):
-        is_subtotal = str(row.get('TAG','')).strip().endswith('TOTAL') and 'Grand' not in str(row.get('TAG',''))
-        is_grand = str(row.get('TAG','')).strip().lower() == 'grand total'
+        is_subtotal = str(row.get("TAG","")).strip().endswith("TOTAL") and "Grand" not in str(row.get("TAG",""))
+        is_grand = str(row.get("TAG","")).strip().lower() == "grand total"
         for c_idx, col in enumerate(final_cols, start=1):
-            val = row.get(col, '.')
+            val = row.get(col, ".")
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
-            if col == 'QTY':
-                # attempt numeric conversion
-                v = str(val).replace(',', '').replace('(', '').replace(')', '').replace('$','').strip()
+            # QTY formatting and red text
+            if col == "QTY":
+                v = str(val).replace(",", "").replace("(", "").replace(")", "").replace("$", "").strip()
                 try:
-                    if v not in ('', '.'):
+                    if v not in ("", "."):
                         cell.value = float(v)
-                        cell.number_format = '0.00'
+                        cell.number_format = "0.00"
                     cell.font = Font(color=qty_red)
                 except:
                     cell.font = Font(color=qty_red)
+            # Subtotal styling
             if is_subtotal:
-                if col == 'QTY':
+                if col == "QTY":
                     cell.font = Font(bold=True, color=qty_red)
                 else:
                     cell.font = Font(bold=True)
                 cell.fill = subtotal_fill
+            # Grand total styling
             if is_grand:
                 cell.font = Font(bold=True)
                 cell.fill = grand_fill
+            # Bold value columns
             if col in bold_value_cols and not is_grand:
-                # make value bold
                 current_font = cell.font or Font()
                 cell.font = Font(bold=True, name=current_font.name, size=current_font.size, color=current_font.color)
 
-    # adjust widths
+    # Adjust widths
     for i, col in enumerate(final_cols, start=1):
         col_letter = get_column_letter(i)
         max_len = max(len(str(col)), max((len(str(ws.cell(row=r, column=i).value or "")) for r in range(2, ws.max_row+1)), default=0)) + 4
         ws.column_dimensions[col_letter].width = min(max_len, 60)
 
-    # return bytes
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -263,18 +285,20 @@ brand_rules = st.sidebar.checkbox("Apply BRAND auto-fill rules (AD-GRD / FAN / S
 model_blank = st.sidebar.checkbox("Keep MODEL column blank", value=True)
 empty_dot = st.sidebar.checkbox("Replace empty cells with '.'", value=True)
 bold_cols_input = st.sidebar.text_area("Bold value columns (comma separated)", value="PRODUCT, SCHEDULE BRAND, BRAND, TAG, MODULE SIZE, TYPE, ACCESSORIES1")
-# parse bold columns
 bold_value_cols = [c.strip() for c in bold_cols_input.split(",") if c.strip()]
 
 if uploaded is not None:
     st.info(f"Processing file: {uploaded.name}")
     df_raw = read_input_file(uploaded)
     try:
-        df_out, final_cols = takeoff_pipeline(df_raw, mapping=DEFAULT_MAPPING,
-                                             brand_rules=brand_rules,
-                                             model_blank=model_blank,
-                                             empty_dot=empty_dot,
-                                             bold_value_cols=bold_value_cols)
+        df_out, final_cols = takeoff_pipeline(
+            df_raw,
+            mapping_multi=MAPPING_MULTI,
+            brand_rules=brand_rules,
+            model_blank=model_blank,
+            empty_dot=empty_dot,
+            bold_value_cols=bold_value_cols,
+        )
     except Exception as e:
         st.error(f"Error processing file: {e}")
         raise
@@ -286,8 +310,8 @@ if uploaded is not None:
     csv_bytes = df_out.to_csv(index=False).encode("utf-8")
     excel_bio = export_styled_excel_bytes(df_out, final_cols, bold_value_cols)
 
-    st.download_button("Download CSV", data=csv_bytes, file_name="TakeoffNSW_Converted.csv", mime="text/csv")
-    st.download_button("Download Excel", data=excel_bio, file_name="TakeoffNSW_Converted.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download CSV (TakeoffNSW plain)", data=csv_bytes, file_name="TakeoffNSW_Converted.csv", mime="text/csv")
+    st.download_button("Download Excel (styled)", data=excel_bio, file_name="TakeoffNSW_Converted.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     st.success("Done — download files above. You can adjust options in the sidebar and re-upload another file.")
 else:
